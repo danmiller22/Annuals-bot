@@ -7,14 +7,15 @@ if (!TELEGRAM_TOKEN) {
   throw new Error("Set TELEGRAM_TOKEN env var");
 }
 
-function parseAnnual(text) {
+// парсим из текста старый формат: PLATE YYYY-MM-DD (на всякий случай оставим)
+function parseFromText(text) {
   if (!text) return null;
 
-  const match = text.match(/\d{4}-\d{2}-\d{2}/);
-  if (!match) return null;
+  const m = text.match(/\d{4}-\d{2}-\d{2}/);
+  if (!m) return null;
 
-  const dateStr = match[0];
-  const before = text.slice(0, match.index).trim().split(/\s+/);
+  const dateStr = m[0];
+  const before = text.slice(0, m.index).trim().split(/\s+/);
   if (!before.length) return null;
 
   const plate = before[before.length - 1].toUpperCase();
@@ -23,6 +24,31 @@ function parseAnnual(text) {
   if (Number.isNaN(d.getTime())) return null;
 
   return { plate, dateStr };
+}
+
+// парсим из имени файла формат MMYYPLATE, например: 1225H03058.pdf
+// 12 -> месяц, 25 -> год (2000+25 = 2025), H03058 -> номер
+// датой считаем ПОСЛЕДНИЙ день месяца
+function parseFromFileName(fileName) {
+  if (!fileName) return null;
+
+  const base = fileName.replace(/\.[^/.]+$/, "").trim(); // без .pdf
+  const m = base.match(/^(\d{2})(\d{2})(.+)$/);
+  if (!m) return null;
+
+  const mm = parseInt(m[1], 10);
+  const yy = parseInt(m[2], 10);
+  if (!(mm >= 1 && mm <= 12)) return null;
+
+  const year = 2000 + yy; // 25 -> 2025
+  const plate = m[3].toUpperCase();
+
+  // последний день месяца: берём 1-е число след. месяца и откатываемся на 1 день
+  const lastDayDate = new Date(Date.UTC(year, mm, 0));
+  const lastDay = lastDayDate.getUTCDate();
+  const iso = `${year}-${String(mm).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+
+  return { plate, dateStr: iso };
 }
 
 async function sendMessage(chatId, text) {
@@ -45,17 +71,31 @@ export default async function handler(req, res) {
   const chatId = message.chat.id;
   const text = message.text || message.caption || "";
 
+  // /start просто даёт инфу, без записи
   if (typeof text === "string" && text.startsWith("/start")) {
     await sendMessage(
       chatId,
-      "Бот активен.\nКидайте сообщения вида 'PLATE YYYY-MM-DD'.\n" +
-        "Он хранит только самый свежий annual по каждому трейлеру и за 30 дней до даты шлёт напоминание."
+      "Бот активен.\n" +
+        "Формат для PDF: имя файла = MMYYНОМЕР_ТРЕЙЛЕРА, например 1225H03058.pdf\n" +
+        "12 = месяц, 25 = год (2025), H03058 = номер.\n" +
+        "Бот считает датой последний день указанного месяца и за 30 дней до неё шлёт напоминание."
     );
     return res.status(200).json({ ok: true });
   }
 
-  const parsed = parseAnnual(text);
-  if (!parsed) return res.status(200).json({ ok: true });
+  let parsed = null;
+
+  // 1) пробуем старый текстовый формат (PLATE YYYY-MM-DD)
+  parsed = parseFromText(text);
+
+  // 2) если не нашли, а есть документ — парсим имя файла
+  if (!parsed && message.document) {
+    parsed = parseFromFileName(message.document.file_name || "");
+  }
+
+  if (!parsed) {
+    return res.status(200).json({ ok: true });
+  }
 
   const { plate, dateStr } = parsed;
 
@@ -74,7 +114,7 @@ export default async function handler(req, res) {
   if (existing) {
     const oldDate = new Date(existing + "T00:00:00Z");
     if (!Number.isNaN(oldDate.getTime()) && newDate <= oldDate) {
-      // новый annual не свежее старого — игнор
+      // новый аннуал не свежее — игнор
       return res.status(200).json({ ok: true });
     }
   }
@@ -87,6 +127,6 @@ export default async function handler(req, res) {
     console.error("State save error", e);
   }
 
-  // бот молчит, без ответов в чат
+  // работает тихо, без ответов
   return res.status(200).json({ ok: true });
 }
